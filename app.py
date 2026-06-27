@@ -15,13 +15,31 @@ import streamlit as st
 # Optional PDF export. The app still works if reportlab is not installed.
 try:
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import cm
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image, KeepTogether
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib import font_manager
+    MATPLOTLIB_AVAILABLE = True
+except Exception:
+    MATPLOTLIB_AVAILABLE = False
+
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    ARABIC_TEXT_AVAILABLE = True
+except Exception:
+    ARABIC_TEXT_AVAILABLE = False
 
 st.set_page_config(
     page_title="Universal Data Analyzer Pro",
@@ -121,6 +139,28 @@ st.markdown(
 }
 .codebox {background:#111827;color:#f9fafb;padding:12px;border-radius:10px; font-family:monospace;}
 .filter-note {font-size: .82rem; color: #38bdf8; font-weight: 600;}
+.chat-card {
+  background: #ffffff;
+  color: #111827;
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 14px 16px;
+  margin: 10px 0 16px 0;
+  line-height: 1.65;
+  box-shadow: 0 3px 12px rgba(16,24,40,0.06);
+}
+.chat-question {
+  background: #f8fafc;
+  color: #111827;
+  border-left: 4px solid #0ea5e9;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-top: 12px;
+  font-weight: 700;
+}
+.chat-card strong {color:#0f172a;}
+.chat-card ul {margin-top: 0.35rem;}
+.chat-card li {margin-bottom: 0.3rem;}
 </style>
 """,
     unsafe_allow_html=True,
@@ -279,6 +319,12 @@ def read_input_file(uploaded_file) -> Tuple[Dict[str, pd.DataFrame], List[str], 
                     if looks_like_metadata_sheet(sheet, df):
                         skipped.append(sheet)
                         continue
+                    # Keep the original sheet name as analytical context.
+                    # For month-named sheets, this becomes a valid time field after cleaning.
+                    if "Source_Sheet" not in df.columns:
+                        df["Source_Sheet"] = sheet
+                    if "Source_Period" not in df.columns:
+                        df["Source_Period"] = sheet
                     sheets[sheet] = df
                 except Exception as e:
                     errors.append(f"Could not read sheet {sheet}: {e}")
@@ -451,6 +497,15 @@ def detect_columns(df: pd.DataFrame) -> Dict[str, Any]:
     product_like = [c for c in df.columns if any(k in c.lower() for k in ["product", "service", "category", "item", "خدمة", "منتج", "فئة"])]
     metric_candidates = [c for c in numeric_cols if any(k in c.lower() for k in ["sales", "value", "revenue", "total", "amount", "net", "قيمة", "مبيعات", "اجمالي"])]
     units_candidates = [c for c in numeric_cols if any(k in c.lower() for k in ["unit", "qty", "quantity", "volume", "count", "عدد", "كمية"])]
+    preferred_time = None
+    for candidate in ["Source_Period", "Month", "month", "الشهر"]:
+        if candidate in df.columns:
+            preferred_time = candidate
+            break
+    preferred_category = branch_like[0] if branch_like else (cat_cols[0] if cat_cols else None)
+    # Avoid using Source_Sheet as the primary category when a real branch/category exists.
+    if preferred_category == "Source_Sheet" and len(cat_cols) > 1:
+        preferred_category = next((c for c in cat_cols if c != "Source_Sheet"), preferred_category)
     return {
         "numeric": numeric_cols,
         "date": date_cols,
@@ -460,8 +515,8 @@ def detect_columns(df: pd.DataFrame) -> Dict[str, Any]:
         "product_like": product_like,
         "metric_default": metric_candidates[0] if metric_candidates else (numeric_cols[0] if numeric_cols else None),
         "units_default": units_candidates[0] if units_candidates else (numeric_cols[1] if len(numeric_cols) > 1 else None),
-        "category_default": branch_like[0] if branch_like else (cat_cols[0] if cat_cols else None),
-        "time_default": date_cols[0] if date_cols else (month_like[0] if month_like else None),
+        "category_default": preferred_category,
+        "time_default": preferred_time or (date_cols[0] if date_cols else (month_like[0] if month_like else None)),
     }
 
 
@@ -668,6 +723,71 @@ def compute_anomalies(df: pd.DataFrame, numeric_cols: List[str]) -> pd.DataFrame
     return pd.DataFrame(records)
 
 
+
+
+def build_performance_comparison(df: pd.DataFrame, category_col: str, metric_col: str, unit_col: Optional[str] = None) -> pd.DataFrame:
+    """Business performance comparison, not statistical comparison.
+
+    The table compares categories by total performance, contribution, rank,
+    value-per-unit (when a unit metric exists), and performance status.
+    It intentionally avoids showing generic mean/count columns as the main comparison.
+    """
+    if df.empty or not category_col or not metric_col or category_col not in df.columns or metric_col not in df.columns:
+        return pd.DataFrame()
+    grouped = df.groupby(category_col, dropna=False)[metric_col].sum().reset_index(name="Total Performance")
+    grouped["Total Performance"] = pd.to_numeric(grouped["Total Performance"], errors="coerce").fillna(0)
+    total = grouped["Total Performance"].sum()
+    grouped["Contribution %"] = np.where(total != 0, grouped["Total Performance"] / total, np.nan)
+    avg_total = grouped["Total Performance"].mean() if not grouped.empty else 0
+    grouped["Vs Average %"] = np.where(avg_total != 0, (grouped["Total Performance"] - avg_total) / avg_total, np.nan)
+    grouped["Rank"] = grouped["Total Performance"].rank(method="dense", ascending=False).astype(int)
+    if unit_col and unit_col in df.columns and unit_col != metric_col:
+        units = df.groupby(category_col, dropna=False)[unit_col].sum().reset_index(name="Total Units")
+        grouped = grouped.merge(units, on=category_col, how="left")
+        grouped["Total Units"] = pd.to_numeric(grouped["Total Units"], errors="coerce").fillna(0)
+        grouped["Performance per Unit"] = np.where(grouped["Total Units"] != 0, grouped["Total Performance"] / grouped["Total Units"], np.nan)
+        unit_total = grouped["Total Units"].sum()
+        grouped["Performance Score"] = np.where(total != 0, grouped["Total Performance"] / total * 70, 0) + np.where(unit_total != 0, grouped["Total Units"] / unit_total * 30, 0)
+    else:
+        grouped["Total Units"] = np.nan
+        grouped["Performance per Unit"] = np.nan
+        grouped["Performance Score"] = np.where(total != 0, grouped["Total Performance"] / total * 100, 0)
+    def _status(v: float) -> str:
+        if pd.isna(v):
+            return "Unclear"
+        if v >= 0.25:
+            return "Strong performer"
+        if v >= -0.10:
+            return "Near average"
+        return "Needs attention"
+    grouped["Performance Status"] = grouped["Vs Average %"].apply(_status)
+    grouped = grouped.sort_values(["Rank", "Total Performance"], ascending=[True, False])
+    display_cols = [category_col, "Rank", "Total Performance", "Contribution %", "Vs Average %"]
+    if unit_col and unit_col in df.columns and unit_col != metric_col:
+        display_cols += ["Total Units", "Performance per Unit", "Performance Score"]
+    else:
+        display_cols += ["Performance Score"]
+    display_cols += ["Performance Status"]
+    return grouped[display_cols]
+
+
+def format_performance_table(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        if col.endswith("%"):
+            out[col] = out[col].apply(lambda x: "N/A" if pd.isna(x) else f"{x:.1%}")
+        elif col in {"Total Performance", "Total Units", "Performance per Unit", "Performance Score"}:
+            out[col] = out[col].apply(lambda x: "N/A" if pd.isna(x) else format_number(x))
+    return out
+
+
+def forecast_labels_from_time(trend: pd.DataFrame, time_col: str, periods: int) -> List[str]:
+    # If the time column is datetime-like, create real future month labels.
+    if not trend.empty and pd.api.types.is_datetime64_any_dtype(trend[time_col]):
+        last = pd.to_datetime(trend[time_col].iloc[-1])
+        return [(last + pd.DateOffset(months=i)).strftime("%b %Y") for i in range(1, periods + 1)]
+    return [f"Future Period {i+1}" for i in range(periods)]
+
 def generate_context(df: pd.DataFrame, report: Dict[str, Any], metric_col: Optional[str], category_col: Optional[str], time_col: Optional[str], unit_col: Optional[str], insights: List[str]) -> str:
     lines: List[str] = []
     lines.append(f"Dataset shape after cleaning/filtering: {df.shape[0]} rows and {df.shape[1]} columns.")
@@ -713,9 +833,13 @@ def ask_groq(question: str, context: str) -> str:
         from groq import Groq
         client = Groq(api_key=api_key)
         system_prompt = (
-            "You are a senior business data analyst. Answer in the same language as the user's question. "
-            "Use only the dashboard context provided. Do not invent numbers. If the context is insufficient, say what is missing. "
-            "Give direct, practical answers with business reasoning, and mention the dashboard section that supports the answer when possible."
+            "You are a senior business data analyst presenting a dashboard. "
+            "Answer in the same language as the user's question. "
+            "Use only the dashboard context provided; never invent numbers. If the context is insufficient, clearly say what is missing. "
+            "Return a clean structured answer with exactly these plain section labels when relevant: Direct answer, Dashboard evidence, Business meaning, Recommended action. "
+            "Use short lines and simple hyphen bullets only. Do not use markdown tables, code blocks, emojis, decorative symbols, box characters, asterisks, pipes, hashes, or random special characters. "
+            "For Arabic answers, write natural Arabic in clear lines. Avoid mixing English unless it is a column name from the dashboard. "
+            "Always mention the dashboard tab or visual that supports the answer when possible."
         )
         completion = client.chat.completions.create(
             model=model,
@@ -726,13 +850,56 @@ def ask_groq(question: str, context: str) -> str:
             temperature=0.2,
             max_tokens=900,
         )
-        return completion.choices[0].message.content
+        return sanitize_ai_text(completion.choices[0].message.content)
     except Exception as e:
-        return f"AI request failed: {e}\n\nFallback answer: {local_answer(question, context)}"
+        return sanitize_ai_text(f"AI request failed: {e}\n\nFallback answer: {local_answer(question, context)}")
+
+
+def contains_arabic(text: Any) -> bool:
+    return bool(re.search(r"[\u0600-\u06FF]", str(text)))
+
+
+@st.cache_resource(show_spinner=False)
+def get_pdf_font_name() -> str:
+    """Register a Unicode font for PDF export when available.
+
+    ReportLab's default fonts can render English well but may show Arabic as squares.
+    This function uses DejaVu Sans from matplotlib when available, which avoids most
+    missing-glyph problems in generated PDF reports.
+    """
+    if not REPORTLAB_AVAILABLE:
+        return "Helvetica"
+    try:
+        if MATPLOTLIB_AVAILABLE:
+            font_path = font_manager.findfont("DejaVu Sans")
+            pdfmetrics.registerFont(TTFont("DejaVuSans", font_path))
+            return "DejaVuSans"
+    except Exception:
+        pass
+    return "Helvetica"
+
+
+def pdf_safe_text(text: Any) -> str:
+    """Prepare text for ReportLab paragraphs/tables.
+
+    For Arabic text, optional reshaping/bidi support improves rendering. If those
+    packages are not installed, the Unicode font still prevents square boxes.
+    """
+    s = "" if text is None else str(text)
+    s = s.replace("\u25a0", "")  # remove replacement square glyphs if any
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if contains_arabic(s) and ARABIC_TEXT_AVAILABLE:
+        try:
+            return get_display(arabic_reshaper.reshape(s))
+        except Exception:
+            return s
+    return s
 
 
 def _p(text: Any, style) -> Paragraph:
-    return Paragraph(escape(str(text)).replace("\n", "<br/>") if text is not None else "", style)
+    value = pdf_safe_text(text)
+    return Paragraph(escape(value).replace("\n", "<br/>") if value is not None else "", style)
 
 
 def _bullet_list(items: List[str], style, max_items: int = 12) -> List[Any]:
@@ -741,9 +908,220 @@ def _bullet_list(items: List[str], style, max_items: int = 12) -> List[Any]:
         body.append(_p("No items available for the current dashboard view.", style))
         return body
     for item in items[:max_items]:
-        body.append(_p(f"- {item}", style))
+        body.append(_p(f"• {item}", style))
     return body
 
+
+def sanitize_ai_text(text: str) -> str:
+    """Clean model output before displaying it in Streamlit."""
+    if text is None:
+        return ""
+    t = str(text)
+    # remove invisible/control characters and common accidental replacement glyphs
+    t = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", t)
+    t = t.replace("\u25a0", "")
+    t = re.sub(r"[■□▪▫◆◇●○◦]+", "", t)
+    # remove markdown/table/code artifacts that look broken in Arabic UI
+    t = t.replace("```", "")
+    t = re.sub(r"^\s*[|]{1,}.*$", "", t, flags=re.MULTILINE)
+    t = re.sub(r"[*#`_]{1,}", "", t)
+    t = re.sub(r"[•●▪▫◦]+", "-", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = t.strip()
+    return t
+
+
+def markdown_to_clean_html(text: str) -> str:
+    """Small, safe renderer for chat answers with RTL/LTR auto direction.
+
+    We intentionally avoid full Markdown tables/code blocks because they often look
+    broken in Arabic. The model is instructed to use headings and bullets instead.
+    """
+    text = sanitize_ai_text(text)
+    lines = text.splitlines()
+    html_parts: List[str] = []
+    in_ul = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            html_parts.append("<br>")
+            continue
+        # Markdown bold support
+        safe = escape(line)
+        safe = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", safe)
+        # remove leftover table separators/code fences
+        if re.fullmatch(r"[\|\-:\s]+", line) or line.startswith("```"):
+            continue
+        if line.startswith(('-', '*', '•')):
+            if not in_ul:
+                html_parts.append("<ul>")
+                in_ul = True
+            item = safe.lstrip("-*• ").strip()
+            html_parts.append(f"<li>{item}</li>")
+        elif re.match(r"^\d+[\.)]\s+", line):
+            if not in_ul:
+                html_parts.append("<ul>")
+                in_ul = True
+            item = re.sub(r"^\d+[\.)]\s+", "", safe)
+            html_parts.append(f"<li>{item}</li>")
+        elif line.endswith(":") and len(line) < 80:
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            html_parts.append(f"<p><strong>{safe}</strong></p>")
+        else:
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            html_parts.append(f"<p>{safe}</p>")
+    if in_ul:
+        html_parts.append("</ul>")
+    return "\n".join(html_parts)
+
+
+def render_chat_pair(question: str, answer: str):
+    st.markdown(f'<div class="chat-question" dir="auto">Q: {escape(str(question))}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="chat-card" dir="auto">{markdown_to_clean_html(answer)}</div>', unsafe_allow_html=True)
+
+
+def add_mckinsey_page_number(canvas, doc):
+    canvas.saveState()
+    canvas.setFont(get_pdf_font_name(), 8)
+    canvas.setFillColor(colors.HexColor("#64748b"))
+    canvas.drawRightString(A4[0] - 1.2*cm, 0.65*cm, f"Page {doc.page}")
+    canvas.setFillColor(colors.HexColor("#0f172a"))
+    canvas.rect(0, A4[1]-0.35*cm, A4[0], 0.12*cm, fill=1, stroke=0)
+    canvas.restoreState()
+
+
+def _chart_buffer(fig) -> Optional[io.BytesIO]:
+    if not MATPLOTLIB_AVAILABLE:
+        return None
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def make_bar_chart_image(df: pd.DataFrame, x_col: str, y_col: str, title: str, top_n: int = 10) -> Optional[io.BytesIO]:
+    if not MATPLOTLIB_AVAILABLE or df.empty or x_col not in df.columns or y_col not in df.columns:
+        return None
+    tmp = df[[x_col, y_col]].copy().head(top_n)
+    fig, ax = plt.subplots(figsize=(7.8, 4.2))
+    labels = [pdf_safe_text(v)[:26] for v in tmp[x_col].astype(str).tolist()]
+    values = pd.to_numeric(tmp[y_col], errors="coerce").fillna(0).values
+    y_pos = np.arange(len(labels))
+    ax.barh(y_pos, values, color="#0f62fe")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_title(pdf_safe_text(title), fontsize=12, fontweight="bold", color="#0f172a")
+    ax.grid(axis="x", alpha=0.25)
+    ax.spines[["top", "right"]].set_visible(False)
+    return _chart_buffer(fig)
+
+
+def make_line_chart_image(df: pd.DataFrame, x_col: str, y_col: str, title: str) -> Optional[io.BytesIO]:
+    if not MATPLOTLIB_AVAILABLE or df.empty or x_col not in df.columns or y_col not in df.columns:
+        return None
+    fig, ax = plt.subplots(figsize=(7.8, 4.0))
+    labels = [pdf_safe_text(v)[:18] for v in df[x_col].astype(str).tolist()]
+    values = pd.to_numeric(df[y_col], errors="coerce").fillna(0).values
+    ax.plot(range(len(values)), values, marker="o", linewidth=2.5, color="#0f62fe")
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=8)
+    ax.set_title(pdf_safe_text(title), fontsize=12, fontweight="bold", color="#0f172a")
+    ax.grid(axis="y", alpha=0.25)
+    ax.spines[["top", "right"]].set_visible(False)
+    return _chart_buffer(fig)
+
+
+def make_hist_chart_image(df: pd.DataFrame, metric_col: str, title: str) -> Optional[io.BytesIO]:
+    if not MATPLOTLIB_AVAILABLE or df.empty or metric_col not in df.columns:
+        return None
+    s = pd.to_numeric(df[metric_col], errors="coerce").dropna()
+    if s.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(7.8, 3.8))
+    ax.hist(s, bins=min(25, max(8, int(np.sqrt(len(s))))), color="#0f62fe", alpha=0.85)
+    ax.set_title(pdf_safe_text(title), fontsize=12, fontweight="bold", color="#0f172a")
+    ax.grid(axis="y", alpha=0.25)
+    ax.spines[["top", "right"]].set_visible(False)
+    return _chart_buffer(fig)
+
+
+def make_heatmap_image(df: pd.DataFrame, numeric_cols: List[str], title: str) -> Optional[io.BytesIO]:
+    if not MATPLOTLIB_AVAILABLE or len(numeric_cols) < 2 or df.empty:
+        return None
+    cols = numeric_cols[:10]
+    corr = df[cols].corr(numeric_only=True)
+    if corr.empty:
+        return None
+    fig, ax = plt.subplots(figsize=(7.8, 5.4))
+    im = ax.imshow(corr, cmap="Blues", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(cols)))
+    ax.set_xticklabels([pdf_safe_text(c)[:14] for c in cols], rotation=45, ha="right", fontsize=7)
+    ax.set_yticks(range(len(cols)))
+    ax.set_yticklabels([pdf_safe_text(c)[:14] for c in cols], fontsize=7)
+    ax.set_title(pdf_safe_text(title), fontsize=12, fontweight="bold", color="#0f172a")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    return _chart_buffer(fig)
+
+
+def make_forecast_chart_image(trend: pd.DataFrame, time_col: str, metric_col: str, forecast_values: pd.Series, title: str) -> Optional[io.BytesIO]:
+    if not MATPLOTLIB_AVAILABLE or trend.empty:
+        return None
+    actual_values = pd.to_numeric(trend[metric_col], errors="coerce").fillna(0).values
+    labels = [pdf_safe_text(v)[:14] for v in trend[time_col].astype(str).tolist()] + [f"F{i+1}" for i in range(len(forecast_values))]
+    all_x = range(len(labels))
+    fig, ax = plt.subplots(figsize=(7.8, 4.0))
+    ax.plot(range(len(actual_values)), actual_values, marker="o", linewidth=2.5, color="#0f62fe", label="Actual")
+    start = len(actual_values) - 1
+    forecast_line = np.concatenate([[actual_values[-1]], forecast_values.values]) if len(actual_values) else forecast_values.values
+    ax.plot(range(start, start + len(forecast_line)), forecast_line, marker="o", linewidth=2.2, linestyle="--", color="#f97316", label="Forecast")
+    ax.set_xticks(list(all_x))
+    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=8)
+    ax.set_title(pdf_safe_text(title), fontsize=12, fontweight="bold", color="#0f172a")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend()
+    ax.spines[["top", "right"]].set_visible(False)
+    return _chart_buffer(fig)
+
+
+def add_image(story: List[Any], img_buf: Optional[io.BytesIO], width_cm: float = 16.0):
+    if img_buf is None:
+        return
+    img = Image(img_buf)
+    target_width = width_cm * cm
+    try:
+        ratio = target_width / float(img.imageWidth)
+        img.drawWidth = target_width
+        img.drawHeight = float(img.imageHeight) * ratio
+    except Exception:
+        img.drawWidth = target_width
+    story.append(img)
+    story.append(Spacer(1, 8))
+
+
+def build_table(rows: List[List[Any]], col_widths: List[float], style, header_fill: str = "#111827") -> Table:
+    tbl = Table([[_p(c, style) for c in row] for row in rows], colWidths=[w*cm for w in col_widths], repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(header_fill)),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d9e2ec")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    return tbl
 
 def top_correlation_pairs(df: pd.DataFrame, numeric_cols: List[str], max_pairs: int = 5) -> List[str]:
     if len(numeric_cols) < 2 or df.empty:
@@ -772,141 +1150,225 @@ def generate_pdf_report(
     active_filters: Optional[List[str]] = None,
     numeric_cols: Optional[List[str]] = None,
 ) -> Optional[bytes]:
-    """Generate a full PDF that explains the dashboard pages and visuals, not just Q&A."""
+    """Generate a McKinsey-style PDF with charts and page-by-page dashboard explanation."""
     if not REPORTLAB_AVAILABLE:
         return None
     df = df.copy() if df is not None else pd.DataFrame()
     numeric_cols = numeric_cols or []
     active_filters = active_filters or ["No active filters - all cleaned rows are included."]
+    font_name = get_pdf_font_name()
 
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=1.2*cm, leftMargin=1.2*cm, topMargin=1.1*cm, bottomMargin=1.1*cm)
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=1.05*cm,
+        leftMargin=1.05*cm,
+        topMargin=1.0*cm,
+        bottomMargin=1.0*cm,
+    )
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("TitleCustom", parent=styles["Title"], fontSize=22, leading=26, textColor=colors.HexColor("#111827"), spaceAfter=12)
-    h_style = ParagraphStyle("HeaderCustom", parent=styles["Heading2"], fontSize=14, leading=18, textColor=colors.HexColor("#0369a1"), spaceBefore=12, spaceAfter=7)
-    h3_style = ParagraphStyle("SubHeaderCustom", parent=styles["Heading3"], fontSize=11.5, leading=15, textColor=colors.HexColor("#111827"), spaceBefore=7, spaceAfter=4)
-    body_style = ParagraphStyle("BodyCustom", parent=styles["BodyText"], fontSize=9.2, leading=12.3, textColor=colors.HexColor("#111827"), spaceAfter=4)
-    small_style = ParagraphStyle("SmallCustom", parent=styles["BodyText"], fontSize=8.2, leading=10.5, textColor=colors.HexColor("#475467"), spaceAfter=3)
+    title_style = ParagraphStyle("TitleCustom", parent=styles["Title"], fontName=font_name, fontSize=22, leading=26, textColor=colors.HexColor("#0f172a"), spaceAfter=10)
+    subtitle_style = ParagraphStyle("Subtitle", parent=styles["BodyText"], fontName=font_name, fontSize=10, leading=14, textColor=colors.HexColor("#475467"), spaceAfter=8)
+    headline_style = ParagraphStyle("Headline", parent=styles["Heading1"], fontName=font_name, fontSize=15, leading=18, textColor=colors.HexColor("#0f62fe"), spaceBefore=8, spaceAfter=6)
+    h_style = ParagraphStyle("HeaderCustom", parent=styles["Heading2"], fontName=font_name, fontSize=13, leading=16, textColor=colors.HexColor("#0f172a"), spaceBefore=8, spaceAfter=5)
+    h3_style = ParagraphStyle("SubHeaderCustom", parent=styles["Heading3"], fontName=font_name, fontSize=10.8, leading=13.5, textColor=colors.HexColor("#0f172a"), spaceBefore=5, spaceAfter=3)
+    body_style = ParagraphStyle("BodyCustom", parent=styles["BodyText"], fontName=font_name, fontSize=8.8, leading=11.8, textColor=colors.HexColor("#111827"), spaceAfter=4)
+    small_style = ParagraphStyle("SmallCustom", parent=styles["BodyText"], fontName=font_name, fontSize=7.8, leading=10.2, textColor=colors.HexColor("#475467"), spaceAfter=3)
+    callout_style = ParagraphStyle("Callout", parent=styles["BodyText"], fontName=font_name, fontSize=10, leading=13, textColor=colors.HexColor("#111827"), backColor=colors.HexColor("#eff6ff"), borderColor=colors.HexColor("#bfdbfe"), borderWidth=0.5, borderPadding=7, spaceAfter=8)
 
     story: List[Any] = []
-    story.append(_p("Universal Data Analyzer Pro - Dashboard Explanation Report", title_style))
-    story.append(_p(f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}", small_style))
-    story.append(_p("This report explains what the dashboard found, what each page means, and how each visual should be interpreted from the current filtered view.", body_style))
-    story.append(Spacer(1, 10))
 
-    # KPI summary table
-    story.append(_p("1. Current Dashboard Snapshot", h_style))
-    table_data = [[_p("Metric", body_style), _p("Value", body_style)]] + [[_p(k, body_style), _p(v, body_style)] for k, v in summary.items()]
-    table = Table(table_data, colWidths=[6.7*cm, 8.7*cm])
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#e5e7eb")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
-    ]))
-    story.append(table)
+    # Cover / executive message
+    story.append(_p("Universal Data Analyzer Pro", title_style))
+    story.append(_p("McKinsey-style Dashboard Explanation Report", headline_style))
+    story.append(_p(f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}", subtitle_style))
+    story.append(_p("This report summarizes the current dashboard view, explains every dashboard tab, and includes visuals generated from the filtered dataset.", subtitle_style))
+
+    total_metric = None
+    if metric_col and metric_col in df.columns:
+        total_metric = df[metric_col].sum(skipna=True)
+    top_label = "N/A"
+    top_share = None
+    top_value = None
+    if metric_col and category_col and metric_col in df.columns and category_col in df.columns and not df.empty:
+        ranking_all = df.groupby(category_col, dropna=False)[metric_col].sum().sort_values(ascending=False)
+        if not ranking_all.empty and ranking_all.sum() != 0:
+            top_label = str(ranking_all.index[0])
+            top_value = ranking_all.iloc[0]
+            top_share = top_value / ranking_all.sum()
+
+    one_line = "The dashboard provides a business-ready view of data quality, performance, drivers, anomalies, forecast direction, and comparison insights."
+    if metric_col and total_metric is not None:
+        one_line = f"Current filtered performance shows {format_number(total_metric)} in {metric_col}."
+        if top_share is not None:
+            one_line += f" The leading {category_col} is {top_label}, contributing {top_share:.1%} of the selected metric."
+    story.append(_p("Key message", h_style))
+    story.append(_p(one_line, callout_style))
+
+    snapshot_rows = [
+        ["Indicator", "Current value"],
+        ["Rows after cleaning and filters", summary.get("Rows analyzed", df.shape[0])],
+        ["Columns analyzed", summary.get("Columns analyzed", df.shape[1])],
+        ["Main metric", metric_col or "N/A"],
+        ["Main metric total", format_number(total_metric) if total_metric is not None else "N/A"],
+        ["Primary category", category_col or "N/A"],
+        ["Top contributor", top_label],
+        ["Data quality score", f"{report.get('data_quality_score', 'N/A')}/100"],
+        ["Outlier points", report.get("outlier_total", 0)],
+        ["Missing cells", report.get("missing_total", 0)],
+    ]
+    story.append(build_table(snapshot_rows, [7.1, 8.5], small_style))
+    story.append(Spacer(1, 8))
     story.append(_p("Active filters", h3_style))
-    story.extend(_bullet_list(active_filters, small_style, max_items=12))
+    story.extend(_bullet_list(active_filters, small_style, max_items=10))
 
-    story.append(_p("2. Executive Business Summary", h_style))
-    story.extend(_bullet_list(insights, body_style, max_items=12))
+    # Executive summary
+    story.append(PageBreak())
+    story.append(_p("1. Executive Summary", headline_style))
+    story.append(_p("What the dashboard is saying", h_style))
+    story.extend(_bullet_list(insights[:8], body_style, max_items=8))
     if alerts:
-        story.append(_p("Critical alerts", h3_style))
+        story.append(_p("Risks and alerts", h_style))
         story.extend(_bullet_list(alerts, body_style, max_items=8))
 
-    # Cleaning page explanation
-    story.append(PageBreak())
-    story.append(_p("3. Page-by-Page Dashboard Explanation", h_style))
-    story.append(_p("Page 1 - Cleaning & Quality", h3_style))
-    story.append(_p("This page validates whether the dataset is reliable enough for business decisions. It shows the Data Quality Score, rows removed, duplicate rows, missing values, type corrections, and outlier detection. The goal is to prevent decisions based on inflated, incomplete, or inconsistent data.", body_style))
-    dq = [
-        ["Data quality score", f"{report.get('data_quality_score', 'N/A')}/100"],
-        ["Original rows", str(report.get("original_rows", "N/A"))],
-        ["Cleaned rows", str(report.get("cleaned_rows", "N/A"))],
-        ["Duplicates removed", str(report.get("duplicate_rows_removed", 0))],
-        ["Missing cells", str(report.get("missing_total", 0))],
-        ["Outlier points", str(report.get("outlier_total", 0))],
-    ]
-    dq_table = Table([[ _p("Check", body_style), _p("Result", body_style) ]] + [[_p(a, small_style), _p(b, small_style)] for a,b in dq], colWidths=[7.3*cm, 8.1*cm])
-    dq_table.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#e5e7eb")), ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")])]))
-    story.append(dq_table)
-
-    # Overview
-    story.append(_p("Page 2 - Executive Overview", h3_style))
+    # Visuals: overview trend/ranking
+    story.append(_p("2. Dashboard Visuals and Interpretation", headline_style))
     if metric_col and metric_col in df.columns:
-        total = format_number(df[metric_col].sum())
-        story.append(_p(f"This page answers the first management question: what happened overall? The main KPI total for {metric_col} is {total}. The page also shows either a time trend or a distribution chart, plus ranking by the selected primary category.", body_style))
-        if category_col and category_col in df.columns and not df.empty:
-            ranking = df.groupby(category_col, dropna=False)[metric_col].sum().sort_values(ascending=False)
-            if not ranking.empty:
-                top = ranking.index[0]
-                top_val = ranking.iloc[0]
-                share = top_val / ranking.sum() if ranking.sum() else np.nan
-                story.append(_p(f"Top contributor: {top} with {format_number(top_val)} ({share:.1%} of current filtered total).", body_style))
         if time_col and time_col in df.columns:
             trend = aggregate_by_time(df, time_col, metric_col)
             if not trend.empty:
-                best = trend.loc[trend[metric_col].idxmax()]
-                story.append(_p(f"Strongest period in the trend: {best[time_col]} with {format_number(best[metric_col])}.", body_style))
-    else:
-        story.append(_p("This page needs a numeric main metric to produce KPI totals, trends, and rankings.", body_style))
+                story.append(_p("Visual 1 — Performance trend", h_style))
+                story.append(_p(f"This visual shows how {metric_col} changed across the selected time period. It is used to detect growth, decline, seasonality, and campaign impact.", body_style))
+                add_image(story, make_line_chart_image(trend, time_col, metric_col, f"{metric_col} Trend"))
+                if len(trend) >= 2:
+                    first, last = trend[metric_col].iloc[0], trend[metric_col].iloc[-1]
+                    change = (last - first) / abs(first) if first else np.nan
+                    if not pd.isna(change):
+                        direction = "increased" if last >= first else "declined"
+                        story.append(_p(f"Interpretation: {metric_col} {direction} by {change:.1%} from the first to the last visible period.", callout_style))
+        else:
+            story.append(_p("Visual 1 — Metric distribution", h_style))
+            story.append(_p(f"This visual shows the spread of {metric_col} across rows. It helps identify whether values are balanced or concentrated in a few extreme records.", body_style))
+            add_image(story, make_hist_chart_image(df, metric_col, f"Distribution of {metric_col}"))
+
+        if category_col and category_col in df.columns:
+            ranking = df.groupby(category_col, dropna=False)[metric_col].sum().sort_values(ascending=False).head(10).reset_index()
+            story.append(_p("Visual 2 — Top contributors ranking", h_style))
+            story.append(_p(f"This chart ranks the top {category_col} values by {metric_col}. It explains which branch/category/product drives the selected metric.", body_style))
+            add_image(story, make_bar_chart_image(ranking, category_col, metric_col, f"Top {category_col} by {metric_col}", top_n=10))
+            top_rows = [[category_col, metric_col, "Share"]]
+            total = ranking[metric_col].sum()
+            for _, r in ranking.head(8).iterrows():
+                share = r[metric_col] / total if total else 0
+                top_rows.append([str(r[category_col]), format_number(r[metric_col]), f"{share:.1%}"])
+            story.append(build_table(top_rows, [7.2, 4.3, 3.8], small_style))
 
     # Deep analysis
-    story.append(_p("Page 3 - Deep Analysis", h3_style))
-    story.append(_p("This page explains relationships and unusual patterns. The scatter plot compares two numeric measures, the correlation heatmap shows which metrics move together, anomaly detection flags unusual records, and benchmarking ranks categories against the average and the best performer.", body_style))
-    corr_pairs = top_correlation_pairs(df, numeric_cols, max_pairs=5)
-    if corr_pairs:
-        story.append(_p("Strongest visible metric relationships", h3_style))
-        story.extend(_bullet_list(corr_pairs, small_style, max_items=5))
-    anomalies = compute_anomalies(df, numeric_cols)
-    story.append(_p(f"Anomaly detection found {len(anomalies)} strong z-score anomaly rows in the current view.", body_style))
-
-    # Forecast page
     story.append(PageBreak())
-    story.append(_p("Page 4 - Forecast & What-if", h3_style))
+    story.append(_p("3. Deep Analysis", headline_style))
+    story.append(_p("This section explains the analytical pages of the dashboard: correlations, anomalies, benchmarking, and relationships between value and volume metrics.", body_style))
+    if len(numeric_cols) >= 2:
+        story.append(_p("Visual 3 — Correlation heatmap", h_style))
+        story.append(_p("The heatmap shows which numeric metrics move together. Strong positive relationships may indicate connected sales drivers or duplicated/related columns. Strong negative relationships may indicate trade-offs.", body_style))
+        add_image(story, make_heatmap_image(df, numeric_cols, "Correlation Heatmap"))
+        corr_pairs = top_correlation_pairs(df, numeric_cols, max_pairs=6)
+        if corr_pairs:
+            story.append(_p("Strongest visible metric relationships", h3_style))
+            story.extend(_bullet_list(corr_pairs, small_style, max_items=6))
+    anomalies = compute_anomalies(df, numeric_cols)
+    story.append(_p("Anomaly detection", h_style))
+    story.append(_p(f"The dashboard detected {len(anomalies)} strong z-score anomaly rows in the current filtered view. These records should be reviewed before using the output for incentives, targets, or official reporting.", body_style))
+    if not anomalies.empty:
+        rows = [["Row", "Column", "Value", "Z-score"]]
+        for _, r in anomalies.head(10).iterrows():
+            rows.append([r["row_index"], r["column"], format_number(r["value"]), f"{r['z_score']:.2f}"])
+        story.append(build_table(rows, [2.3, 6.2, 4.0, 3.0], small_style))
+
+    if metric_col and category_col and metric_col in df.columns and category_col in df.columns:
+        story.append(_p("Performance comparison and benchmarking", h_style))
+        perf = build_performance_comparison(df, category_col, metric_col, unit_col)
+        rows = [[category_col, "Rank", "Total performance", "Contribution", "Vs average", "Status"]]
+        if not perf.empty:
+            for _, r in perf.head(8).iterrows():
+                rows.append([str(r[category_col]), int(r["Rank"]), format_number(r["Total Performance"]), f"{r['Contribution %']:.1%}" if not pd.isna(r["Contribution %"]) else "N/A", f"{r['Vs Average %']:.1%}" if not pd.isna(r["Vs Average %"]) else "N/A", str(r["Performance Status"])])
+        story.append(build_table(rows, [4.6, 1.5, 3.1, 2.3, 2.2, 2.6], small_style))
+        story.append(_p("Interpretation: comparison is based on performance contribution and rank, not generic mean/count measures. This identifies true business leaders and categories needing attention.", callout_style))
+
+    # Future performance forecast
+    story.append(PageBreak())
+    story.append(_p("4. Future Performance Forecast", headline_style))
     if metric_col and time_col and metric_col in df.columns and time_col in df.columns:
         trend = aggregate_by_time(df, time_col, metric_col)
         if len(trend) >= 2:
             forecast_values, r2 = simple_forecast(trend[metric_col], periods=6)
-            story.append(_p(f"The forecast page estimates the next periods for {metric_col} using a simple trend model. The current trend fit R² is {r2:.2f}. This forecast is indicative, not a final planning forecast, because reliability improves with more historical periods, targets, campaigns, and seasonality data.", body_style))
-            story.append(_p("Next forecast values", h3_style))
-            forecast_rows = [[_p("Forecast period", small_style), _p("Expected value", small_style)]]
+            story.append(_p(f"The forecast uses the visible historical trend of {metric_col}. Current trend fit R² = {r2:.2f}. This is directional, not a final planning forecast.", body_style))
+            add_image(story, make_forecast_chart_image(trend, time_col, metric_col, forecast_values, f"{metric_col}: Actual + Forecast"))
+            rows = [["Forecast period", "Expected value"]]
             for i, v in enumerate(forecast_values, 1):
-                forecast_rows.append([_p(f"Forecast {i}", small_style), _p(format_number(v), small_style)])
-            ft = Table(forecast_rows, colWidths=[7.3*cm, 8.1*cm])
-            ft.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#e5e7eb")), ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")])]))
-            story.append(ft)
+                rows.append([f"Forecast {i}", format_number(v)])
+            story.append(build_table(rows, [7.6, 7.6], small_style))
         else:
-            story.append(_p("Forecasting needs at least two time periods after filtering.", body_style))
+            story.append(_p("Forecasting needs at least two visible time periods. Add more historical periods to improve reliability.", callout_style))
     else:
-        story.append(_p("Forecasting needs both a selected main metric and a valid time column.", body_style))
-    story.append(_p("The what-if section lets management test how performance changes if the selected metric increases or decreases. It is useful for target planning, branch improvement scenarios, and estimating the impact of upselling.", body_style))
+        story.append(_p("Forecasting needs both a selected main metric and a valid time column. Without a time column, the dashboard cannot create a time-series forecast.", callout_style))
+    story.append(_p("Forecast interpretation", h_style))
+    story.append(_p("This page is dedicated to future performance forecasting. What-if assumptions are intentionally excluded so the forecast remains separate from scenario simulation.", body_style))
 
-    # Comparison and AI
-    story.append(_p("Page 5 - Comparison Mode", h3_style))
-    story.append(_p("This page compares selected categories, such as branches, products, services, segments, or regions. If a time column is available, it shows how each selected category performs over time. This helps detect consistent performers, declining performers, and categories that require intervention.", body_style))
-    story.append(_p("Page 6 - AI Chat", h3_style))
-    story.append(_p("The AI Chat answers natural-language questions in the user's language using summarized dashboard context. The API key is stored in Streamlit Secrets and is not exposed in the frontend. The chat should be used to explain the dashboard, identify risks, and translate insights into business actions.", body_style))
-    story.append(_p("Page 7 - Executive PDF", h3_style))
-    story.append(_p("This page exports the current dashboard view into a PDF report. The report reflects the current filters, selected metric, selected category, cleaning results, alerts, trends, and dashboard interpretation.", body_style))
+    # Cleaning and data quality page
+    story.append(PageBreak())
+    story.append(_p("5. Cleaning & Data Quality", headline_style))
+    story.append(_p("This page checks whether the dataset is reliable enough for decision-making. It does not only show the score; it explains what was changed and what still needs review.", body_style))
+    dq_rows = [["Quality check", "Result", "Business impact"]]
+    dq_rows += [
+        ["Data quality score", f"{report.get('data_quality_score', 'N/A')}/100", "Higher score means fewer visible structural problems."],
+        ["Original rows", report.get("original_rows", "N/A"), "Base dataset size before cleaning."],
+        ["Cleaned rows", report.get("cleaned_rows", "N/A"), "Rows available after cleaning rules."],
+        ["Duplicates removed", report.get("duplicate_rows_removed", 0), "Duplicates may inflate totals."],
+        ["Missing cells", report.get("missing_total", 0), "Missing data can bias totals and averages."],
+        ["Outlier points", report.get("outlier_total", 0), "Outliers can distort incentives, targets, and forecasts."],
+        ["Numeric conversions", len(report.get("converted_numeric_columns", [])), "Converted text numbers make calculations possible."],
+        ["Date conversions", len(report.get("converted_date_columns", [])), "Converted dates enable trend and forecast analysis."],
+    ]
+    story.append(build_table(dq_rows, [4.6, 3.0, 7.8], small_style))
+    if report.get("missing_by_column"):
+        story.append(_p("Top missing columns", h3_style))
+        rows = [["Column", "Missing values"]]
+        for k, v in list(report["missing_by_column"].items())[:10]:
+            rows.append([k, v])
+        story.append(build_table(rows, [10.0, 5.4], small_style))
+
+    # Page-by-page explanation
+    story.append(PageBreak())
+    story.append(_p("6. Page-by-Page Dashboard Guide", headline_style))
+    guide_rows = [
+        ["Dashboard tab", "Question answered", "How to read it"],
+        ["Cleaning & Quality", "Can the data be trusted?", "Review score, duplicates, missing values, type corrections, and outliers before making decisions."],
+        ["Executive Overview", "What happened overall?", "Use KPI cards, trend/distribution chart, top contributors, and auto insights."],
+        ["Deep Analysis", "Why did it happen?", "Use scatter, correlation, anomaly detection, and benchmarking to understand drivers and unusual patterns."],
+        ["Future Performance Forecast", "What may happen next?", "Use forecast as a directional view of future performance based on visible historical periods."],
+        ["Performance Comparison", "Who performs better?", "Compare branches/categories by total performance, contribution share, rank, value per unit, and status."],
+        ["AI Chat", "Can users ask natural-language questions?", "The chat uses summarized dashboard context and answers in the user's language without exposing the API key."],
+        ["Full Dashboard PDF", "How do we document the analysis?", "Exports the current filtered view, visual explanations, risks, and recommended actions."],
+    ]
+    story.append(build_table(guide_rows, [3.6, 5.0, 7.0], small_style))
 
     # Recommendations
-    story.append(_p("4. Recommended Next Actions", h_style))
+    story.append(_p("7. Recommended Management Actions", headline_style))
     recommendations = [
-        "Validate column definitions before using the numbers for incentives or official performance decisions.",
-        "Use the Data Quality page before presenting results; missing values, duplicates, and outliers can change the story.",
-        "Use the Executive Overview to identify the strongest contributors, then investigate their practices for replication.",
-        "Use the Deep Analysis page to identify relationships between value, volume, and other performance metrics.",
-        "Treat the forecast as directional unless the dataset contains enough historical periods and target/campaign context.",
-        "Use Comparison Mode to review month-over-month or branch-over-branch changes before taking action.",
+        "Start every review from the Cleaning & Quality page before interpreting performance.",
+        "Use the Executive Overview to identify the leading contributor and check whether performance is concentrated.",
+        "Use Deep Analysis to verify whether strong correlations are real business relationships or duplicated/related columns.",
+        "Review anomaly records before using the data for targets, incentives, or official reporting.",
+        "Treat the forecast as directional unless the dataset contains enough historical periods, targets, campaigns, and seasonality context.",
+        "Use Performance Comparison to compare branch/category contribution, rank, value-per-unit, and trend before taking action.",
+        "Keep column definitions documented so future reports do not confuse volume, value, original, net, or adjusted metrics.",
     ]
     story.extend(_bullet_list(recommendations, body_style, max_items=10))
 
-    doc.build(story)
+    doc.build(story, onFirstPage=add_mckinsey_page_number, onLaterPages=add_mckinsey_page_number)
     buffer.seek(0)
     return buffer.getvalue()
-
 
 def alert_system(df: pd.DataFrame, report: Dict[str, Any], metric_col: Optional[str], category_col: Optional[str]) -> List[str]:
     alerts: List[str] = []
@@ -957,12 +1419,18 @@ if not raw_sheets:
     st.stop()
 
 with st.sidebar:
-    sheet_name = st.selectbox("Choose data sheet", list(raw_sheets.keys()))
+    sheet_options = list(raw_sheets.keys())
+    if len(sheet_options) > 1:
+        sheet_options = ["All data sheets combined"] + sheet_options
+    sheet_name = st.selectbox("Choose data sheet", sheet_options, index=0)
     if skipped_sheets:
         with st.expander("Skipped metadata/log sheets"):
             st.write(skipped_sheets)
 
-raw_df = raw_sheets[sheet_name]
+if sheet_name == "All data sheets combined":
+    raw_df = pd.concat(raw_sheets.values(), ignore_index=True, sort=False)
+else:
+    raw_df = raw_sheets[sheet_name]
 clean_df, cleaning_report = clean_dataframe(raw_df, remove_duplicates=remove_dupes)
 columns_info = detect_columns(clean_df)
 
@@ -1074,8 +1542,8 @@ tabs = st.tabs([
     "Cleaning & Quality",
     "Executive Overview",
     "Deep Analysis",
-    "Forecast & What-if",
-    "Comparison Mode",
+    "Future Performance Forecast",
+    "Performance Comparison",
     "AI Chat",
     "Full Dashboard PDF",
 ])
@@ -1198,78 +1666,115 @@ with tabs[2]:
         else:
             st.dataframe(anomalies.head(100), use_container_width=True, hide_index=True)
     with c4:
-        st.write("**Benchmarking**")
+        st.write("**Performance Benchmarking**")
         if metric_col and category_col:
-            bench = filtered_df.groupby(category_col, dropna=False)[metric_col].agg(["sum", "mean", "count"]).reset_index()
-            avg_sum = bench["sum"].mean()
-            best_sum = bench["sum"].max()
-            bench["vs_average_%"] = np.where(avg_sum != 0, (bench["sum"] - avg_sum) / avg_sum, np.nan)
-            bench["vs_best_%"] = np.where(best_sum != 0, bench["sum"] / best_sum, np.nan)
-            bench = bench.sort_values("sum", ascending=False)
-            st.dataframe(bench, use_container_width=True, hide_index=True)
+            bench = build_performance_comparison(filtered_df, category_col, metric_col, unit_col)
+            if bench.empty:
+                st.info("No benchmarking data is available after filters.")
+            else:
+                st.dataframe(format_performance_table(bench), use_container_width=True, hide_index=True)
         else:
-            st.info("Select main metric and category to enable benchmarking.")
+            st.info("Select main metric and category to enable performance benchmarking.")
 
 with tabs[3]:
-    st.markdown('<div class="section-header">Forecast & What-if Scenarios</div>', unsafe_allow_html=True)
-    c1, c2 = st.columns([1.2, 1])
-    with c1:
-        periods = st.slider("Forecast periods", 1, 12, 6)
-        if metric_col and time_col and time_col in filtered_df.columns:
-            trend = aggregate_by_time(filtered_df, time_col, metric_col)
+    st.markdown('<div class="section-header">Future Performance Forecast</div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+<div class="insight-card">
+This page is dedicated to forecasting only. It uses the selected metric and time column to estimate future performance. What-if assumptions were removed to keep forecasting separate from scenario simulation.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    periods = st.slider("Forecast periods", 1, 12, 6)
+    if metric_col and time_col and time_col in filtered_df.columns:
+        trend = aggregate_by_time(filtered_df, time_col, metric_col)
+        if len(trend) >= 2:
             forecast_values, r2 = simple_forecast(trend[metric_col], periods=periods)
-            future_labels = [f"Forecast {i+1}" for i in range(periods)]
+            future_labels = forecast_labels_from_time(trend, time_col, periods)
             actual = pd.DataFrame({"Period": trend[time_col].astype(str), "Value": trend[metric_col], "Type": "Actual"})
             future = pd.DataFrame({"Period": future_labels, "Value": forecast_values, "Type": "Forecast"})
             chart_df = pd.concat([actual, future], ignore_index=True)
-            fig = px.line(chart_df, x="Period", y="Value", color="Type", markers=True, title=f"Forecast for {metric_col}")
+            c1, c2, c3, c4 = st.columns(4)
+            last_actual = float(pd.to_numeric(trend[metric_col], errors="coerce").dropna().iloc[-1])
+            forecast_total = float(forecast_values.sum())
+            forecast_avg = float(forecast_values.mean()) if len(forecast_values) else 0
+            growth_from_last = (float(forecast_values.iloc[-1]) - last_actual) / abs(last_actual) if last_actual else np.nan
+            with c1:
+                kpi_card("Last Actual Period", format_number(last_actual), "Latest visible period")
+            with c2:
+                kpi_card("Forecast Total", format_number(forecast_total), f"Next {periods} periods")
+            with c3:
+                kpi_card("Avg Forecast Period", format_number(forecast_avg), metric_col)
+            with c4:
+                kpi_card("Forecast Fit", f"R² {r2:.2f}", "Directional reliability")
+            fig = px.line(chart_df, x="Period", y="Value", color="Type", markers=True, title=f"Future Performance Forecast for {metric_col}")
+            fig.update_layout(legend_title_text="Series")
             st.plotly_chart(fig, use_container_width=True)
-            st.info(f"Forecast is indicative. Simple trend fit R² = {r2:.2f}. More months improve reliability.")
+            forecast_table = future.rename(columns={"Period": "Forecast Period", "Value": f"Forecasted {metric_col}"})[["Forecast Period", f"Forecasted {metric_col}"]]
+            forecast_table[f"Forecasted {metric_col}"] = forecast_table[f"Forecasted {metric_col}"].apply(format_number)
+            st.dataframe(forecast_table, use_container_width=True, hide_index=True)
+            if not pd.isna(growth_from_last):
+                direction = "increase" if growth_from_last >= 0 else "decline"
+                st.markdown(f"<div class='insight-card'>Forecast interpretation: the final forecast period suggests a {direction} of {growth_from_last:.1%} compared with the last actual period. Treat this as directional, not a final target.</div>", unsafe_allow_html=True)
+            st.markdown(
+                """
+<div class="warning-card">
+Forecast reliability depends on the quality and length of historical data. For stronger forecasting, add at least 12 months of history, campaign dates, targets, seasonality notes, and cost/margin fields.
+</div>
+""",
+                unsafe_allow_html=True,
+            )
         else:
-            st.warning("Select both a main metric and a time column to enable forecasting.")
-    with c2:
-        st.write("**What-if Scenario**")
-        if metric_col:
-            pct = st.slider("Change selected metric by", -50, 100, 10, step=5)
-            current_total = filtered_df[metric_col].sum()
-            scenario_total = current_total * (1 + pct / 100)
-            impact = scenario_total - current_total
-            st.metric("Current total", format_number(current_total))
-            st.metric("Scenario total", format_number(scenario_total), delta=format_number(impact))
-            st.markdown(f"If **{metric_col}** changes by **{pct}%**, the total changes by **{format_number(impact)}**.")
-        else:
-            st.info("Select a numeric metric first.")
+            st.warning("Forecasting needs at least two visible time periods. Choose a sheet with a Month/Period column or use the combined-sheet option if your Excel has monthly sheets.")
+    else:
+        st.warning("Select a main metric and a valid time column to enable forecasting. If your file has separate monthly sheets, choose 'All data sheets combined' so the app can use Source_Period as the time field.")
 
-    if category_col and metric_col:
-        st.write("**Scenario by Category**")
-        scenario_category = st.selectbox("Apply scenario to one category", ["All"] + sorted(filtered_df[category_col].dropna().astype(str).unique().tolist()))
-        pct2 = st.slider("Category-level change", -50, 100, 15, step=5, key="cat_scenario_pct")
-        base = filtered_df.copy()
-        if scenario_category != "All":
-            mask = base[category_col].astype(str) == scenario_category
-            base.loc[mask, "_Scenario_Value"] = base.loc[mask, metric_col] * (1 + pct2/100)
-            base.loc[~mask, "_Scenario_Value"] = base.loc[~mask, metric_col]
-        else:
-            base["_Scenario_Value"] = base[metric_col] * (1 + pct2/100)
-        st.metric("Scenario impact", format_number(base["_Scenario_Value"].sum() - base[metric_col].sum()))
 
 with tabs[4]:
-    st.markdown('<div class="section-header">Comparison Mode</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">Performance Comparison</div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+<div class="insight-card">
+This comparison is based on business performance: total selected metric, contribution share, rank, value per unit when available, and performance status. It avoids comparing generic statistical measures like mean/count as the main result.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
     if category_col and metric_col:
         values = sorted(filtered_df[category_col].dropna().astype(str).unique().tolist())
-        selected_values = st.multiselect(f"Compare {category_col}", values, default=values[:2])
+        all_perf = build_performance_comparison(filtered_df, category_col, metric_col, unit_col)
+        default_values = all_perf[category_col].astype(str).head(3).tolist() if not all_perf.empty and category_col in all_perf.columns else values[:3]
+        selected_values = st.multiselect(f"Compare {category_col}", values, default=default_values)
         comp_df = filtered_df[filtered_df[category_col].astype(str).isin(selected_values)] if selected_values else filtered_df
-        if time_col and time_col in comp_df.columns:
-            comp = comp_df.groupby([category_col, time_col], dropna=False)[metric_col].sum().reset_index()
-            if not pd.api.types.is_datetime64_any_dtype(comp[time_col]):
-                comp["_sort"] = comp[time_col].apply(month_sort_key)
-                comp = comp.sort_values("_sort").drop(columns="_sort")
-            fig = px.line(comp, x=time_col, y=metric_col, color=category_col, markers=True, title=f"{category_col} Comparison Over Time")
-            st.plotly_chart(fig, use_container_width=True)
-        comp_summary = comp_df.groupby(category_col, dropna=False)[metric_col].agg(["sum", "mean", "count"]).sort_values("sum", ascending=False).reset_index()
-        st.dataframe(comp_summary, use_container_width=True, hide_index=True)
+        perf = build_performance_comparison(comp_df, category_col, metric_col, unit_col)
+        if perf.empty:
+            st.info("No comparable records are available after filters.")
+        else:
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                fig = px.bar(perf, x=category_col, y="Total Performance", text="Total Performance", title=f"Performance by {category_col}")
+                fig.update_traces(texttemplate='%{text:.2s}', textposition='outside')
+                st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                fig = px.bar(perf, x=category_col, y="Contribution %", text="Contribution %", title="Contribution Share")
+                fig.update_traces(texttemplate='%{text:.1%}', textposition='outside')
+                st.plotly_chart(fig, use_container_width=True)
+            if unit_col and unit_col in comp_df.columns and unit_col != metric_col:
+                fig = px.scatter(perf, x="Total Units", y="Total Performance", size="Performance Score", color=category_col, hover_name=category_col, title="Value vs Volume Performance")
+                st.plotly_chart(fig, use_container_width=True)
+            if time_col and time_col in comp_df.columns:
+                comp = comp_df.groupby([category_col, time_col], dropna=False)[metric_col].sum().reset_index()
+                if not pd.api.types.is_datetime64_any_dtype(comp[time_col]):
+                    comp["_sort"] = comp[time_col].apply(month_sort_key)
+                    comp = comp.sort_values("_sort").drop(columns="_sort")
+                fig = px.line(comp, x=time_col, y=metric_col, color=category_col, markers=True, title=f"Performance Trend by {category_col}")
+                st.plotly_chart(fig, use_container_width=True)
+            st.write("**Performance comparison table**")
+            st.dataframe(format_performance_table(perf), use_container_width=True, hide_index=True)
     else:
-        st.info("Select a main metric and a category to enable comparison mode.")
+        st.info("Select a main metric and a category to enable performance comparison.")
+
 
 with tabs[5]:
     st.markdown('<div class="section-header">Secure Multilingual AI Chat</div>', unsafe_allow_html=True)
@@ -1314,8 +1819,7 @@ The API key is read from <b>Streamlit Secrets</b>, not from the frontend. The ch
             st.session_state.chat_history.append((question.strip(), answer))
 
     for q, a in reversed(st.session_state.chat_history[-10:]):
-        st.markdown(f"**Q:** {q}")
-        st.markdown(f"**A:** {a}")
+        render_chat_pair(q, a)
         st.divider()
 
 with tabs[6]:
