@@ -1742,10 +1742,16 @@ This comparison is based on business performance: total selected metric, contrib
         unsafe_allow_html=True,
     )
     if category_col and metric_col:
-        values = sorted(filtered_df[category_col].dropna().astype(str).unique().tolist())
+        # Streamlit requires every default value to exist inside the options list.
+        # Uploaded datasets may contain Arabic text, hidden spaces, or values removed by filters,
+        # so we normalize options/defaults and keep only valid defaults to avoid StreamlitAPIException.
+        values = sorted(filtered_df[category_col].dropna().astype(str).str.strip().unique().tolist())
         all_perf = build_performance_comparison(filtered_df, category_col, metric_col, unit_col)
-        default_values = all_perf[category_col].astype(str).head(3).tolist() if not all_perf.empty and category_col in all_perf.columns else values[:3]
-        selected_values = st.multiselect(f"Compare {category_col}", values, default=default_values)
+        candidate_defaults = all_perf[category_col].astype(str).str.strip().head(3).tolist() if not all_perf.empty and category_col in all_perf.columns else values[:3]
+        default_values = [v for v in candidate_defaults if v in values][:3]
+        if not default_values and values:
+            default_values = values[: min(3, len(values))]
+        selected_values = st.multiselect(f"Compare {category_col}", options=values, default=default_values)
         comp_df = filtered_df[filtered_df[category_col].astype(str).isin(selected_values)] if selected_values else filtered_df
         perf = build_performance_comparison(comp_df, category_col, metric_col, unit_col)
         if perf.empty:
