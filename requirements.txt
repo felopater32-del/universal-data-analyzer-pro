@@ -5,3 +5,6 @@ plotly>=5.18.0
 openpyxl>=3.1.0
 groq>=0.9.0
 reportlab>=4.0.0
+matplotlib>=3.8.0
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
